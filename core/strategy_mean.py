@@ -37,7 +37,7 @@ class MeanReversionBot:
         self.avg_cost = 0.0
         
         # Config 
-        self.tranche_size = 93.0  # About 1/3 of total 2000 RBM (~280 USDT)
+        self.tranche_size = 110.0  # Must be > 100 USDT for MIN_NOTIONAL filter on BTCUSDT
         self.timeout_sec = 5 * 60 # 5 minutes
         self.fee_rate = 0.001     # estimated taker fee rate 0.05% + slip = 0.1% safe margin
         self.stop_loss_pct = 0.015 # 1.5% Hard Stop
