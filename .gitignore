@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.log
+*.sqlite3
+*.db
+*.ipynb_checkpoints/
+
+# VSCode
+.vscode/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment
+.env
+.env.*
+*.env
+*.envrc
+
+# Conda
+*.conda
+*.env
+*.yml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+
+# Notebooks outputs
+*.nbconvert.ipynb
+
+# Others
+*.bak
+*.swp
+*.tmp
