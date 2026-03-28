@@ -33,9 +33,11 @@ class MeanReversionBot:
         self.entry_orders = [] # Unfilled entry limit orders
         self.exit_order_id = None
         self.blocked_reason = ""
+        self.opposite_position_handling = "AUTO_FLATTEN" if cfg.AUTO_FLATTEN_OPPOSITE_POSITION else "BLOCK"
         
         self.order_placed_time = 0.0
         self.last_retry_time = 0.0
+        self.last_flatten_attempt_time = 0.0
         self.position_amt = 0.0
         self.avg_cost = 0.0
         
@@ -113,6 +115,12 @@ class MeanReversionBot:
     def _mark_retry(self):
         self.last_retry_time = time.time()
 
+    def _can_attempt_flatten(self) -> bool:
+        return (time.time() - self.last_flatten_attempt_time) >= self.retry_cooldown_sec
+
+    def _mark_flatten_attempt(self):
+        self.last_flatten_attempt_time = time.time()
+
     def fetch_initial_data(self):
         try:
             klines = self.rest_client.klines(self.symbol, "1m", limit=10)
@@ -133,9 +141,7 @@ class MeanReversionBot:
                 self.state = "WAITING_EXIT"
                 logger.info(f"Recovered existing position: {self.position_amt} @ {self.avg_cost}")
             elif self.position_amt < 0:
-                self.state = "BLOCKED"
-                self.blocked_reason = f"Detected existing short position {self.position_amt} @ {self.avg_cost}. Mean strategy is long-only."
-                logger.error(self.blocked_reason)
+                self._handle_opposite_position("startup")
             else:
                 self.state = "NO_POS"
                 self.position_amt = 0.0
@@ -170,12 +176,72 @@ class MeanReversionBot:
 
         return 0.0, 0.0
 
+    def _set_blocked_for_short(self):
+        self.state = "BLOCKED"
+        self.blocked_reason = f"Detected existing short position {self.position_amt} @ {self.avg_cost}. Mean strategy is long-only."
+        logger.error(self.blocked_reason)
+
+    def _handle_opposite_position(self, source: str):
+        if self.position_amt >= 0:
+            return
+
+        if not cfg.AUTO_FLATTEN_OPPOSITE_POSITION:
+            self._set_blocked_for_short()
+            return
+
+        if not self._can_attempt_flatten():
+            self.state = "BLOCKED"
+            return
+
+        short_qty = self._normalize_qty_up(abs(self.position_amt))
+        self._mark_flatten_attempt()
+        logger.warning(f"Detected opposite short position during {source}. Sending reduce-only MARKET BUY to flatten {short_qty} {self.symbol}.")
+
+        try:
+            self.rest_client.cancel_open_orders(symbol=self.symbol)
+        except Exception as e:
+            logger.error(f"Error canceling orders before flattening short: {e}")
+
+        try:
+            self.rest_client.new_order(
+                symbol=self.symbol,
+                side="BUY",
+                type="MARKET",
+                quantity=short_qty,
+                reduceOnly="true",
+            )
+            time.sleep(0.5)
+            account_data = self.rest_client.account(symbol=self.symbol)
+            self.position_amt, self.avg_cost = self._extract_position_info(account_data)
+
+            if self.position_amt < 0:
+                self._set_blocked_for_short()
+                return
+
+            if self.position_amt > 0:
+                self.state = "WAITING_EXIT"
+                self.blocked_reason = ""
+                logger.info(f"Flatten completed with residual long position: {self.position_amt} @ {self.avg_cost}")
+            else:
+                self.state = "NO_POS"
+                self.avg_cost = 0.0
+                self.blocked_reason = ""
+                self._mark_retry()
+                logger.info("Opposite short position flattened. Strategy resumed from flat state.")
+        except Exception as e:
+            self._set_blocked_for_short()
+            logger.error(f"Failed to flatten opposite short position: {e}")
+
     def on_tick(self):
         if len(self.close_prices) < 10:
             return
         if self.current_price <= 0:
             return
-        if self.state == "BLOCKED":
+        if self.state == "BLOCKED" and self.position_amt < 0 and cfg.AUTO_FLATTEN_OPPOSITE_POSITION:
+            self._handle_opposite_position("runtime")
+            if self.state == "BLOCKED":
+                return
+        elif self.state == "BLOCKED":
             return
             
         prices = list(self.close_prices)
@@ -324,9 +390,7 @@ class MeanReversionBot:
             positions = self.rest_client.account(symbol=self.symbol)
             self.position_amt, self.avg_cost = self._extract_position_info(positions)
             if self.position_amt < 0:
-                self.state = "BLOCKED"
-                self.blocked_reason = f"Detected existing short position {self.position_amt} @ {self.avg_cost}. Mean strategy is long-only."
-                logger.error(self.blocked_reason)
+                self._handle_opposite_position("runtime")
             elif self.state == "BLOCKED" and self.position_amt == 0:
                 self.state = "NO_POS"
                 self.blocked_reason = ""

@@ -34,3 +34,5 @@ TP_2_OFFSET = float(os.getenv("TP_TIER_2_PCT", "0.0020"))
 TP_BE_OFFSET = float(os.getenv("TP_BREAK_EVEN_PCT", "0.0002"))
 
 TIMEOUT_MINUTES = int(os.getenv("TIMEOUT_MINUTES", "10"))
+
+AUTO_FLATTEN_OPPOSITE_POSITION = os.getenv("AUTO_FLATTEN_OPPOSITE_POSITION", "True").lower() in ("true", "1", "yes")
