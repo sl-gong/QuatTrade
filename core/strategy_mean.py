@@ -44,7 +44,22 @@ class MeanReversionBot:
         
         self.fetch_initial_data()
         self.sync_account_info()
+        self.fetch_exchange_info()
         
+    def fetch_exchange_info(self):
+        try:
+            info = self.rest_client.exchange_info()
+            for s in info['symbols']:
+                if s['symbol'] == self.symbol:
+                    self.price_precision = s['pricePrecision']
+                    self.qty_precision = s['quantityPrecision']
+                    logger.info(f"Loaded precision for {self.symbol}: Price({self.price_precision}), Qty({self.qty_precision})")
+                    break
+        except Exception as e:
+            logger.error(f"Error fetching exchange info: {e}")
+            self.price_precision = 1
+            self.qty_precision = 3
+
     def fetch_initial_data(self):
         try:
             klines = self.rest_client.klines(self.symbol, "1m", limit=10)
@@ -118,13 +133,13 @@ class MeanReversionBot:
             b1 = p_mean - 1 * sigma
             b2 = p_mean - 3 * sigma
             
-            qty_b1 = round(self.tranche_size / b1, 4)
-            qty_b2 = round(self.tranche_size / b2, 4)
+            qty_b1 = round(self.tranche_size / b1, self.qty_precision)
+            qty_b2 = round(self.tranche_size / b2, self.qty_precision)
             
             try:
-                logger.info(f"Placing ENTRY orders... B1: {b1:.4f} (qty:{qty_b1}), B2: {b2:.4f} (qty:{qty_b2})")
-                r1 = self.rest_client.new_order(symbol=self.symbol, side="BUY", type="LIMIT", timeInForce="GTC", quantity=qty_b1, price=round(b1, 5))
-                r2 = self.rest_client.new_order(symbol=self.symbol, side="BUY", type="LIMIT", timeInForce="GTC", quantity=qty_b2, price=round(b2, 5))
+                logger.info(f"Placing ENTRY orders... B1: {b1:.{self.price_precision}f} (qty:{qty_b1}), B2: {b2:.{self.price_precision}f} (qty:{qty_b2})")
+                r1 = self.rest_client.new_order(symbol=self.symbol, side="BUY", type="LIMIT", timeInForce="GTC", quantity=qty_b1, price=round(b1, self.price_precision))
+                r2 = self.rest_client.new_order(symbol=self.symbol, side="BUY", type="LIMIT", timeInForce="GTC", quantity=qty_b2, price=round(b2, self.price_precision))
                 self.entry_orders = [r1['orderId'], r2['orderId']]
                 self.order_placed_time = time.time()
                 self.state = "WAITING_ENTRY"
@@ -155,9 +170,9 @@ class MeanReversionBot:
                 breakeven_price = self.avg_cost * (1 + self.fee_rate * 2) # roundtrip fee
                 exit_price = max(raw_exit, breakeven_price)
                 
-                logger.info(f"Placing EXIT order... AvgCost: {self.avg_cost:.4f}, Target: {raw_exit:.4f}, Adjusted (Breakeven): {exit_price:.4f}")
+                logger.info(f"Placing EXIT order... AvgCost: {self.avg_cost:.{self.price_precision}f}, Target: {raw_exit:.{self.price_precision}f}, Adjusted (Breakeven): {exit_price:.{self.price_precision}f}")
                 try:
-                    r = self.rest_client.new_order(symbol=self.symbol, side="SELL", type="LIMIT", timeInForce="GTC", quantity=self.position_amt, price=round(exit_price, 5))
+                    r = self.rest_client.new_order(symbol=self.symbol, side="SELL", type="LIMIT", timeInForce="GTC", quantity=round(self.position_amt, self.qty_precision), price=round(exit_price, self.price_precision))
                     self.exit_order_id = r['orderId']
                     self.order_placed_time = time.time()
                 except Exception as e:
