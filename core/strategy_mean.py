@@ -3,6 +3,7 @@ import collections
 import json
 import math
 import time
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 import numpy as np
 
 import websockets
@@ -33,18 +34,20 @@ class MeanReversionBot:
         self.exit_order_id = None
         
         self.order_placed_time = 0.0
+        self.last_retry_time = 0.0
         self.position_amt = 0.0
         self.avg_cost = 0.0
         
         # Config 
         self.tranche_size = 110.0  # Must be > 100 USDT for MIN_NOTIONAL filter on BTCUSDT
         self.timeout_sec = 5 * 60 # 5 minutes
+        self.retry_cooldown_sec = 5
         self.fee_rate = 0.001     # estimated taker fee rate 0.05% + slip = 0.1% safe margin
         self.stop_loss_pct = 0.015 # 1.5% Hard Stop
         
         self.fetch_initial_data()
-        self.sync_account_info()
         self.fetch_exchange_info()
+        self.sync_account_info()
         
     def fetch_exchange_info(self):
         try:
@@ -53,12 +56,61 @@ class MeanReversionBot:
                 if s['symbol'] == self.symbol:
                     self.price_precision = s['pricePrecision']
                     self.qty_precision = s['quantityPrecision']
+                    self.tick_size = Decimal("0.1")
+                    self.step_size = Decimal("0.001")
+                    self.min_qty = Decimal("0.001")
+                    self.min_notional = Decimal("100")
+
+                    for f in s.get('filters', []):
+                        if f['filterType'] == 'PRICE_FILTER':
+                            self.tick_size = Decimal(f['tickSize'])
+                        elif f['filterType'] == 'LOT_SIZE':
+                            self.step_size = Decimal(f['stepSize'])
+                            self.min_qty = Decimal(f['minQty'])
+                        elif f['filterType'] == 'MIN_NOTIONAL':
+                            self.min_notional = Decimal(f['notional'])
+
                     logger.info(f"Loaded precision for {self.symbol}: Price({self.price_precision}), Qty({self.qty_precision})")
                     break
         except Exception as e:
             logger.error(f"Error fetching exchange info: {e}")
             self.price_precision = 1
             self.qty_precision = 3
+            self.tick_size = Decimal("0.1")
+            self.step_size = Decimal("0.001")
+            self.min_qty = Decimal("0.001")
+            self.min_notional = Decimal("100")
+
+    def _round_to_step(self, value: float, step: Decimal, rounding) -> float:
+        value_dec = Decimal(str(value))
+        steps = (value_dec / step).quantize(Decimal("1"), rounding=rounding)
+        normalized = steps * step
+        return float(normalized)
+
+    def _normalize_price(self, price: float) -> float:
+        return self._round_to_step(price, self.tick_size, ROUND_DOWN)
+
+    def _normalize_qty_down(self, qty: float) -> float:
+        qty = self._round_to_step(qty, self.step_size, ROUND_DOWN)
+        return max(qty, float(self.min_qty))
+
+    def _normalize_qty_up(self, qty: float) -> float:
+        qty = self._round_to_step(qty, self.step_size, ROUND_UP)
+        return max(qty, float(self.min_qty))
+
+    def _build_order_qty(self, price: float) -> float:
+        target_qty = max(self.tranche_size / price, float(self.min_notional / Decimal(str(price))))
+        qty = self._normalize_qty_up(target_qty)
+        return qty
+
+    def _format_price(self, price: float) -> str:
+        return f"{price:.{self.price_precision}f}"
+
+    def _has_retry_cooldown(self) -> bool:
+        return (time.time() - self.last_retry_time) < self.retry_cooldown_sec
+
+    def _mark_retry(self):
+        self.last_retry_time = time.time()
 
     def fetch_initial_data(self):
         try:
@@ -94,6 +146,8 @@ class MeanReversionBot:
     def on_tick(self):
         if len(self.close_prices) < 10:
             return
+        if self.current_price <= 0:
+            return
             
         prices = list(self.close_prices)
         p_mean = np.mean(prices)
@@ -126,25 +180,61 @@ class MeanReversionBot:
                 
                 # Check status
                 self._update_position_state()
+                if self.position_amt > 0:
+                    self.state = "WAITING_EXIT"
+                else:
+                    self.state = "NO_POS"
+                    self._mark_retry()
 
         # --- State Machine ---
         if self.state == "NO_POS":
+            if self._has_retry_cooldown():
+                return
+
             # Place entry limits
-            b1 = p_mean - 1 * sigma
-            b2 = p_mean - 3 * sigma
+            b1 = self._normalize_price(p_mean - 1 * sigma)
+            b2 = self._normalize_price(p_mean - 3 * sigma)
+
+            if b1 <= 0 or b2 <= 0:
+                logger.error("Computed invalid entry price, skip this round.")
+                self._mark_retry()
+                return
             
-            qty_b1 = round(self.tranche_size / b1, self.qty_precision)
-            qty_b2 = round(self.tranche_size / b2, self.qty_precision)
+            qty_b1 = self._build_order_qty(b1)
+            qty_b2 = self._build_order_qty(b2)
             
             try:
-                logger.info(f"Placing ENTRY orders... B1: {b1:.{self.price_precision}f} (qty:{qty_b1}), B2: {b2:.{self.price_precision}f} (qty:{qty_b2})")
-                r1 = self.rest_client.new_order(symbol=self.symbol, side="BUY", type="LIMIT", timeInForce="GTC", quantity=qty_b1, price=round(b1, self.price_precision))
-                r2 = self.rest_client.new_order(symbol=self.symbol, side="BUY", type="LIMIT", timeInForce="GTC", quantity=qty_b2, price=round(b2, self.price_precision))
-                self.entry_orders = [r1['orderId'], r2['orderId']]
-                self.order_placed_time = time.time()
-                self.state = "WAITING_ENTRY"
+                logger.info(f"Placing ENTRY orders... B1: {self._format_price(b1)} (qty:{qty_b1}), B2: {self._format_price(b2)} (qty:{qty_b2})")
+                self.entry_orders = []
+
+                for price, qty in ((b1, qty_b1), (b2, qty_b2)):
+                    notional = price * qty
+                    if qty < float(self.min_qty) or notional < float(self.min_notional):
+                        logger.warning(f"Skip invalid entry order: price={self._format_price(price)}, qty={qty}, notional={notional:.4f}")
+                        continue
+
+                    order = self.rest_client.new_order(
+                        symbol=self.symbol,
+                        side="BUY",
+                        type="LIMIT",
+                        timeInForce="GTC",
+                        quantity=qty,
+                        price=price,
+                    )
+                    self.entry_orders.append(order['orderId'])
+
+                if self.entry_orders:
+                    self.order_placed_time = time.time()
+                    self.state = "WAITING_ENTRY"
+                else:
+                    logger.warning("No valid entry orders were submitted.")
+                    self.state = "NO_POS"
+                    self._mark_retry()
             except Exception as e:
                 logger.error(f"Error placing entry orders: {e}")
+                self.state = "NO_POS"
+                self.entry_orders = []
+                self._mark_retry()
 
         elif self.state == "WAITING_ENTRY":
             # Check if partially or fully filled via WS feed or aggressive sync timeout
@@ -160,23 +250,33 @@ class MeanReversionBot:
                 
                 # Immediately move to EXIt logic
                 self.on_tick()
+            elif not self.entry_orders:
+                self.state = "NO_POS"
+                self._mark_retry()
 
         elif self.state == "WAITING_EXIT":
             if self.exit_order_id is None:
                 # Place limit exit
-                raw_exit = p_mean + 1 * sigma
+                raw_exit = self._normalize_price(p_mean + 1 * sigma)
                 
                 # Patch 1: Breakeven check (Cost + Fee)
                 breakeven_price = self.avg_cost * (1 + self.fee_rate * 2) # roundtrip fee
-                exit_price = max(raw_exit, breakeven_price)
+                exit_price = self._normalize_price(max(raw_exit, breakeven_price))
+                exit_qty = self._normalize_qty_down(self.position_amt)
+
+                if exit_qty <= 0:
+                    logger.error("Invalid exit quantity, skip placing exit order.")
+                    self._mark_retry()
+                    return
                 
-                logger.info(f"Placing EXIT order... AvgCost: {self.avg_cost:.{self.price_precision}f}, Target: {raw_exit:.{self.price_precision}f}, Adjusted (Breakeven): {exit_price:.{self.price_precision}f}")
+                logger.info(f"Placing EXIT order... AvgCost: {self._format_price(self.avg_cost)}, Target: {self._format_price(raw_exit)}, Adjusted (Breakeven): {self._format_price(exit_price)}")
                 try:
-                    r = self.rest_client.new_order(symbol=self.symbol, side="SELL", type="LIMIT", timeInForce="GTC", quantity=round(self.position_amt, self.qty_precision), price=round(exit_price, self.price_precision))
+                    r = self.rest_client.new_order(symbol=self.symbol, side="SELL", type="LIMIT", timeInForce="GTC", quantity=exit_qty, price=exit_price)
                     self.exit_order_id = r['orderId']
                     self.order_placed_time = time.time()
                 except Exception as e:
                     logger.error(f"Error placing exit order: {e}")
+                    self._mark_retry()
                     
             else:
                 # Need to check if exit filled
@@ -193,19 +293,21 @@ class MeanReversionBot:
     def _update_position_state(self):
         try:
             positions = self.rest_client.account(symbol=self.symbol)
+            self.position_amt = 0.0
+            self.avg_cost = 0.0
             for pos in positions.get("positions", []):
                 if pos['symbol'] == self.symbol:
                     self.position_amt = float(pos['positionAmt'])
                     self.avg_cost = float(pos['entryPrice'])
                     break
         except Exception as e:
-            pass
+            logger.error(f"Error updating position state: {e}")
 
     def _market_sell_all(self):
         try:
             self.rest_client.cancel_open_orders(symbol=self.symbol)
             if self.position_amt > 0:
-                self.rest_client.new_order(symbol=self.symbol, side="SELL", type="MARKET", quantity=self.position_amt)
+                self.rest_client.new_order(symbol=self.symbol, side="SELL", type="MARKET", quantity=self._normalize_qty_down(self.position_amt))
             self.position_amt = 0
             self.avg_cost = 0
         except Exception as e:
