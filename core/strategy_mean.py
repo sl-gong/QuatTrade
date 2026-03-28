@@ -29,9 +29,10 @@ class MeanReversionBot:
         self.current_price = 0.0
         
         # State
-        self.state = "NO_POS"  # NO_POS, WAITING_ENTRY, WAITING_EXIT
+        self.state = "NO_POS"  # NO_POS, WAITING_ENTRY, WAITING_EXIT, BLOCKED
         self.entry_orders = [] # Unfilled entry limit orders
         self.exit_order_id = None
+        self.blocked_reason = ""
         
         self.order_placed_time = 0.0
         self.last_retry_time = 0.0
@@ -126,27 +127,55 @@ class MeanReversionBot:
         try:
             self.rest_client.cancel_open_orders(symbol=self.symbol)
             positions = self.rest_client.account(symbol=self.symbol)
-            # Find the position
-            for pos in positions.get("positions", []):
-                if pos['symbol'] == self.symbol:
-                    self.position_amt = float(pos['positionAmt'])
-                    self.avg_cost = float(pos['entryPrice'])
-                    break
+            self.position_amt, self.avg_cost = self._extract_position_info(positions)
             
             if self.position_amt > 0:
                 self.state = "WAITING_EXIT"
                 logger.info(f"Recovered existing position: {self.position_amt} @ {self.avg_cost}")
+            elif self.position_amt < 0:
+                self.state = "BLOCKED"
+                self.blocked_reason = f"Detected existing short position {self.position_amt} @ {self.avg_cost}. Mean strategy is long-only."
+                logger.error(self.blocked_reason)
             else:
                 self.state = "NO_POS"
                 self.position_amt = 0.0
                 self.avg_cost = 0.0
+                self.blocked_reason = ""
         except Exception as e:
             logger.error(f"Error syncing account info: {e}")
+
+    def _extract_position_info(self, account_data):
+        position_amt = 0.0
+        avg_cost = 0.0
+
+        for pos in account_data.get("positions", []):
+            if pos.get('symbol') != self.symbol:
+                continue
+
+            position_amt = float(pos.get('positionAmt', 0.0))
+            if position_amt == 0:
+                return 0.0, 0.0
+
+            raw_entry = pos.get('entryPrice') or pos.get('avgPrice')
+            if raw_entry not in (None, "", "0", "0.0"):
+                avg_cost = float(raw_entry)
+            else:
+                notional = float(pos.get('notional', 0.0))
+                if position_amt != 0 and notional != 0:
+                    avg_cost = abs(notional / position_amt)
+                else:
+                    avg_cost = 0.0
+
+            return position_amt, avg_cost
+
+        return 0.0, 0.0
 
     def on_tick(self):
         if len(self.close_prices) < 10:
             return
         if self.current_price <= 0:
+            return
+        if self.state == "BLOCKED":
             return
             
         prices = list(self.close_prices)
@@ -293,13 +322,14 @@ class MeanReversionBot:
     def _update_position_state(self):
         try:
             positions = self.rest_client.account(symbol=self.symbol)
-            self.position_amt = 0.0
-            self.avg_cost = 0.0
-            for pos in positions.get("positions", []):
-                if pos['symbol'] == self.symbol:
-                    self.position_amt = float(pos['positionAmt'])
-                    self.avg_cost = float(pos['entryPrice'])
-                    break
+            self.position_amt, self.avg_cost = self._extract_position_info(positions)
+            if self.position_amt < 0:
+                self.state = "BLOCKED"
+                self.blocked_reason = f"Detected existing short position {self.position_amt} @ {self.avg_cost}. Mean strategy is long-only."
+                logger.error(self.blocked_reason)
+            elif self.state == "BLOCKED" and self.position_amt == 0:
+                self.state = "NO_POS"
+                self.blocked_reason = ""
         except Exception as e:
             logger.error(f"Error updating position state: {e}")
 
