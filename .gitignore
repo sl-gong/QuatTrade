@@ -29,7 +29,6 @@ build/
 # Conda
 *.conda
 *.env
-*.yml
 
 # OS
 .DS_Store
