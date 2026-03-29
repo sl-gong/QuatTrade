@@ -29,12 +29,32 @@ KLINE_WINDOW = 10
 TRANCHE_SIZE = 200.0
 
 # 入场价格：均值 - N * 标准差。
-# 第一档更靠近均值，第二档更激进。
-ENTRY_STD_MULTIPLIER_1 = 1.0
-ENTRY_STD_MULTIPLIER_2 = 4.0
+# 当前改为单档入场。
+ENTRY_STD_MULTIPLIER = 1.5
 
 # 出场价格：均值 + N * 标准差。
 EXIT_STD_MULTIPLIER = 1.0
+
+# ===== 震荡行情过滤参数 =====
+
+# 是否启用震荡行情过滤。
+# True 时，仅在判定为震荡行情时才允许策略开新仓。
+ENABLE_RANGE_FILTER = True
+
+# 使用最近多少根 1 分钟 K 线判断当前是否处于震荡行情。
+# 例如 15 表示最近 15 分钟。
+RANGE_FILTER_WINDOW = 15
+
+# 对上述窗口内价格计算 MA 的周期。
+RANGE_FILTER_MA_WINDOW = 10
+
+# MA(10) 首尾变化的最大允许比例。
+# 数值越小，越倾向于仅在横盘/弱波动时开仓。
+RANGE_FILTER_MAX_SLOPE_PCT = 0.0015
+
+# MA(10) 曲线在观察窗口内的最大振幅比例。
+# 振幅越小，越接近震荡行情。
+RANGE_FILTER_MAX_BAND_PCT = 0.0025
 
 # 波动率下限，避免横盘时标准差过小导致挂单过于接近现价。
 # 例如 0.001 代表最小波动率按当前价格的 0.1% 计算。

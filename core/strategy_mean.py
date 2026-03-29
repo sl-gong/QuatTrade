@@ -25,7 +25,7 @@ class MeanReversionBot:
         )
         
         # Prices
-        self.close_prices = collections.deque(maxlen=cfg.KLINE_WINDOW)
+        self.close_prices = collections.deque(maxlen=max(cfg.KLINE_WINDOW, cfg.RANGE_FILTER_WINDOW))
         self.current_price = 0.0
         
         # State
@@ -38,15 +38,21 @@ class MeanReversionBot:
         self.order_placed_time = 0.0
         self.last_retry_time = 0.0
         self.last_flatten_attempt_time = 0.0
+        self.last_range_filter_log_time = 0.0
+        self.last_range_filter_state = None
         self.position_amt = 0.0
         self.avg_cost = 0.0
         
         # Config 
         self.kline_window = cfg.KLINE_WINDOW
         self.tranche_size = cfg.TRANCHE_SIZE
-        self.entry_std_multiplier_1 = cfg.ENTRY_STD_MULTIPLIER_1
-        self.entry_std_multiplier_2 = cfg.ENTRY_STD_MULTIPLIER_2
+        self.entry_std_multiplier = cfg.ENTRY_STD_MULTIPLIER
         self.exit_std_multiplier = cfg.EXIT_STD_MULTIPLIER
+        self.enable_range_filter = cfg.ENABLE_RANGE_FILTER
+        self.range_filter_window = cfg.RANGE_FILTER_WINDOW
+        self.range_filter_ma_window = cfg.RANGE_FILTER_MA_WINDOW
+        self.range_filter_max_slope_pct = cfg.RANGE_FILTER_MAX_SLOPE_PCT
+        self.range_filter_max_band_pct = cfg.RANGE_FILTER_MAX_BAND_PCT
         self.sigma_floor_pct = cfg.SIGMA_FLOOR_PCT
         self.timeout_sec = cfg.ORDER_TIMEOUT_SEC
         self.retry_cooldown_sec = cfg.RETRY_COOLDOWN_SEC
@@ -126,9 +132,84 @@ class MeanReversionBot:
     def _mark_flatten_attempt(self):
         self.last_flatten_attempt_time = time.time()
 
+    def _refresh_entry_orders(self):
+        if not self.entry_orders:
+            return []
+
+        try:
+            open_orders = self.rest_client.get_orders(symbol=self.symbol)
+            tracked_order_ids = set(self.entry_orders)
+            active_entry_orders = [
+                order['orderId']
+                for order in open_orders
+                if order.get('side') == 'BUY' and order.get('orderId') in tracked_order_ids
+            ]
+            self.entry_orders = active_entry_orders
+            return active_entry_orders
+        except Exception as e:
+            logger.error(f"Error refreshing entry orders: {e}")
+            return self.entry_orders
+
+    def _log_range_filter(self, is_ranging: bool, ma_slope_pct: float, ma_band_pct: float):
+        now = time.time()
+        should_log = (
+            self.last_range_filter_state is None
+            or self.last_range_filter_state != is_ranging
+            or (now - self.last_range_filter_log_time) >= 60
+        )
+
+        if should_log:
+            if is_ranging:
+                logger.info(
+                    "Range filter passed | "
+                    f"MA({self.range_filter_ma_window}) slope={ma_slope_pct:.6f} <= {self.range_filter_max_slope_pct:.6f}, "
+                    f"band={ma_band_pct:.6f} <= {self.range_filter_max_band_pct:.6f}"
+                )
+            else:
+                logger.info(
+                    "Range filter blocked entry | "
+                    f"MA({self.range_filter_ma_window}) slope={ma_slope_pct:.6f} (limit {self.range_filter_max_slope_pct:.6f}), "
+                    f"band={ma_band_pct:.6f} (limit {self.range_filter_max_band_pct:.6f})"
+                )
+
+            self.last_range_filter_log_time = now
+            self.last_range_filter_state = is_ranging
+
+    def _is_ranging_market(self) -> bool:
+        if not self.enable_range_filter:
+            return True
+
+        if len(self.close_prices) < self.range_filter_window:
+            return False
+
+        recent_prices = list(self.close_prices)[-self.range_filter_window:]
+        if len(recent_prices) < self.range_filter_ma_window:
+            return False
+
+        ma_values = []
+        for i in range(self.range_filter_ma_window, len(recent_prices) + 1):
+            ma_values.append(float(np.mean(recent_prices[i - self.range_filter_ma_window:i])))
+
+        if len(ma_values) < 2 or ma_values[0] <= 0:
+            return False
+
+        ma_start = ma_values[0]
+        ma_end = ma_values[-1]
+        ma_slope_pct = abs(ma_end - ma_start) / ma_start
+        ma_band_pct = (max(ma_values) - min(ma_values)) / ma_start
+
+        is_ranging = (
+            ma_slope_pct <= self.range_filter_max_slope_pct
+            and ma_band_pct <= self.range_filter_max_band_pct
+        )
+
+        self._log_range_filter(is_ranging, ma_slope_pct, ma_band_pct)
+        return is_ranging
+
     def fetch_initial_data(self):
         try:
-            klines = self.rest_client.klines(self.symbol, "1m", limit=self.kline_window)
+            history_limit = max(self.kline_window, self.range_filter_window)
+            klines = self.rest_client.klines(self.symbol, "1m", limit=history_limit)
             for k in klines:
                 close = float(k[4])
                 self.close_prices.append(close)
@@ -258,7 +339,7 @@ class MeanReversionBot:
         logger.debug(f"P_mean: {p_mean:.4f}, Sigma: {sigma:.4f}, Price: {self.current_price}")
 
         # --- Hard Stop Logic ---
-        if self.state == "WAITING_EXIT" and self.position_amt > 0:
+        if self.state in ["WAITING_ENTRY", "WAITING_EXIT"] and self.position_amt > 0:
             stop_price = self.avg_cost * (1 - self.stop_loss_pct)
             if self.current_price <= stop_price:
                 logger.error(f"🚨 HARD STOP TRIGGERED! Price {self.current_price} <= Stop {stop_price:.4f}. Market Selling!")
@@ -291,35 +372,40 @@ class MeanReversionBot:
             if self._has_retry_cooldown():
                 return
 
-            # Place entry limits
-            b1 = self._normalize_price(p_mean - self.entry_std_multiplier_1 * sigma)
-            b2 = self._normalize_price(p_mean - self.entry_std_multiplier_2 * sigma)
+            if not self._is_ranging_market():
+                return
 
-            if b1 <= 0 or b2 <= 0:
+            # Place single entry limit
+            entry_price = self._normalize_price(p_mean - self.entry_std_multiplier * sigma)
+
+            if entry_price <= 0:
                 logger.error("Computed invalid entry price, skip this round.")
                 self._mark_retry()
                 return
             
-            qty_b1 = self._build_order_qty(b1)
-            qty_b2 = self._build_order_qty(b2)
+            entry_qty = self._build_order_qty(entry_price)
             
             try:
-                logger.info(f"Placing ENTRY orders... B1: {self._format_price(b1)} (qty:{qty_b1}), B2: {self._format_price(b2)} (qty:{qty_b2})")
+                logger.info(
+                    f"Placing ENTRY order... Price: {self._format_price(entry_price)} "
+                    f"(qty:{entry_qty})"
+                )
                 self.entry_orders = []
 
-                for price, qty in ((b1, qty_b1), (b2, qty_b2)):
-                    notional = price * qty
-                    if qty < float(self.min_qty) or notional < float(self.min_notional):
-                        logger.warning(f"Skip invalid entry order: price={self._format_price(price)}, qty={qty}, notional={notional:.4f}")
-                        continue
-
+                notional = entry_price * entry_qty
+                if entry_qty < float(self.min_qty) or notional < float(self.min_notional):
+                    logger.warning(
+                        f"Skip invalid entry order: price={self._format_price(entry_price)}, "
+                        f"qty={entry_qty}, notional={notional:.4f}"
+                    )
+                else:
                     order = self.rest_client.new_order(
                         symbol=self.symbol,
                         side="BUY",
                         type="LIMIT",
                         timeInForce="GTC",
-                        quantity=qty,
-                        price=price,
+                        quantity=entry_qty,
+                        price=entry_price,
                     )
                     self.entry_orders.append(order['orderId'])
 
@@ -337,20 +423,22 @@ class MeanReversionBot:
                 self._mark_retry()
 
         elif self.state == "WAITING_ENTRY":
-            # Check if partially or fully filled via WS feed or aggressive sync timeout
+            # Single-entry mode: if the order is partially filled, keep the remaining
+            # quantity alive until it is either fully filled or timed out.
             self._update_position_state()
-            if self.position_amt > 0:
-                logger.info("Order filled! Cancelling remaining entry orders...")
-                try:
-                    self.rest_client.cancel_open_orders(symbol=self.symbol)
-                except:
-                    pass
-                self.entry_orders = []
+            active_entry_orders = self._refresh_entry_orders()
+
+            if self.position_amt > 0 and active_entry_orders:
+                logger.debug(
+                    f"Partial entry filled. Current position: {self.position_amt} @ {self.avg_cost}. "
+                    f"Remaining layered BUY orders: {len(active_entry_orders)}"
+                )
+
+            if self.position_amt > 0 and not active_entry_orders:
+                logger.info("Entry order completed. Switching to exit management.")
                 self.state = "WAITING_EXIT"
-                
-                # Immediately move to EXIt logic
-                self.on_tick()
-            elif not self.entry_orders:
+                self.exit_order_id = None
+            elif self.position_amt == 0 and not active_entry_orders:
                 self.state = "NO_POS"
                 self._mark_retry()
 
