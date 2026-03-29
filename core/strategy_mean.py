@@ -11,7 +11,7 @@ from binance.um_futures import UMFutures
 from binance.error import ClientError
 
 from core.logger import logger
-import core.config as cfg
+import core.config_mean as cfg
 
 class MeanReversionBot:
     def __init__(self):
@@ -25,7 +25,7 @@ class MeanReversionBot:
         )
         
         # Prices
-        self.close_prices = collections.deque(maxlen=10)
+        self.close_prices = collections.deque(maxlen=cfg.KLINE_WINDOW)
         self.current_price = 0.0
         
         # State
@@ -42,11 +42,16 @@ class MeanReversionBot:
         self.avg_cost = 0.0
         
         # Config 
-        self.tranche_size = 110.0  # Must be > 100 USDT for MIN_NOTIONAL filter on BTCUSDT
-        self.timeout_sec = 5 * 60 # 5 minutes
-        self.retry_cooldown_sec = 5
-        self.fee_rate = 0.001     # estimated taker fee rate 0.05% + slip = 0.1% safe margin
-        self.stop_loss_pct = 0.015 # 1.5% Hard Stop
+        self.kline_window = cfg.KLINE_WINDOW
+        self.tranche_size = cfg.TRANCHE_SIZE
+        self.entry_std_multiplier_1 = cfg.ENTRY_STD_MULTIPLIER_1
+        self.entry_std_multiplier_2 = cfg.ENTRY_STD_MULTIPLIER_2
+        self.exit_std_multiplier = cfg.EXIT_STD_MULTIPLIER
+        self.sigma_floor_pct = cfg.SIGMA_FLOOR_PCT
+        self.timeout_sec = cfg.ORDER_TIMEOUT_SEC
+        self.retry_cooldown_sec = cfg.RETRY_COOLDOWN_SEC
+        self.fee_rate = cfg.ESTIMATED_FEE_RATE
+        self.stop_loss_pct = cfg.STOP_LOSS_PCT
         
         self.fetch_initial_data()
         self.fetch_exchange_info()
@@ -123,7 +128,7 @@ class MeanReversionBot:
 
     def fetch_initial_data(self):
         try:
-            klines = self.rest_client.klines(self.symbol, "1m", limit=10)
+            klines = self.rest_client.klines(self.symbol, "1m", limit=self.kline_window)
             for k in klines:
                 close = float(k[4])
                 self.close_prices.append(close)
@@ -233,7 +238,7 @@ class MeanReversionBot:
             logger.error(f"Failed to flatten opposite short position: {e}")
 
     def on_tick(self):
-        if len(self.close_prices) < 10:
+        if len(self.close_prices) < self.kline_window:
             return
         if self.current_price <= 0:
             return
@@ -247,7 +252,7 @@ class MeanReversionBot:
         prices = list(self.close_prices)
         p_mean = np.mean(prices)
         sigma = np.std(prices)
-        sigma_min = self.current_price * 0.0005
+        sigma_min = self.current_price * self.sigma_floor_pct
         sigma = max(sigma, sigma_min)
 
         logger.debug(f"P_mean: {p_mean:.4f}, Sigma: {sigma:.4f}, Price: {self.current_price}")
@@ -287,8 +292,8 @@ class MeanReversionBot:
                 return
 
             # Place entry limits
-            b1 = self._normalize_price(p_mean - 1 * sigma)
-            b2 = self._normalize_price(p_mean - 3 * sigma)
+            b1 = self._normalize_price(p_mean - self.entry_std_multiplier_1 * sigma)
+            b2 = self._normalize_price(p_mean - self.entry_std_multiplier_2 * sigma)
 
             if b1 <= 0 or b2 <= 0:
                 logger.error("Computed invalid entry price, skip this round.")
@@ -352,7 +357,7 @@ class MeanReversionBot:
         elif self.state == "WAITING_EXIT":
             if self.exit_order_id is None:
                 # Place limit exit
-                raw_exit = self._normalize_price(p_mean + 1 * sigma)
+                raw_exit = self._normalize_price(p_mean + self.exit_std_multiplier * sigma)
                 
                 # Patch 1: Breakeven check (Cost + Fee)
                 breakeven_price = self.avg_cost * (1 + self.fee_rate * 2) # roundtrip fee
